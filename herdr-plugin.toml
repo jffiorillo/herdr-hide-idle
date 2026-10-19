@@ -1,0 +1,29 @@
+id = "jffiorillo.hide-idle"
+name = "Hide Idle Agents"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Hide agents idle longer than a TTL from the Agents sidebar, pin and group the rest, and give them short names"
+platforms = ["linux", "macos"]
+
+# Long-running watcher that tracks how long each agent has been idle and
+# re-applies the view; it exits when the server's socket goes away.
+[[startup]]
+command = ["python3", "hide_idle.py", "watch"]
+
+[[actions]]
+id = "toggle"
+title = "Toggle idle agents"
+contexts = ["global"]
+command = ["python3", "hide_idle.py", "toggle"]
+
+[[actions]]
+id = "hide"
+title = "Hide idle agents"
+contexts = ["global"]
+command = ["python3", "hide_idle.py", "hide"]
+
+[[actions]]
+id = "show"
+title = "Show idle agents"
+contexts = ["global"]
+command = ["python3", "hide_idle.py", "show"]
