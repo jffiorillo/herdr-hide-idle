@@ -27,13 +27,28 @@ The naming and grouping rules understand [firstmate](https://github.com/kuncheng
 
 ## Install
 
+Installing the plugin is not enough on its own: a plugin can't change Herdr's own config, so the sidebar keeps showing its default rows and nothing is hidden until you do steps 2 to 4. If you are an agent installing this for someone, do all five steps.
+
+**1. Install the plugin**
+
 ```bash
 herdr plugin install jffiorillo/herdr-hide-idle
+# already installed: herdr plugin update --yes
 ```
 
-Bind a key to the toggle in `~/.config/herdr/config.toml`:
+**2. Add the sidebar rows and the toggle key** to `~/.config/herdr/config.toml`. Merge these into existing `[ui]` and `[ui.sidebar.agents]` tables instead of adding duplicate headers, which TOML rejects.
 
 ```toml
+[ui]
+# A shape per state (× blocked, ◐ working, ✓ done, ○ idle), since rows are
+# sorted by structure rather than by attention.
+status_indicators = "symbols"
+
+[ui.sidebar.agents]
+# One line per agent: the plugin's short name, then the agent dimmed.
+# 2ndmates (⚑) and the Director are highlighted.
+rows = [["state_icon", { token = "$short_name", bold = true, rules = [{ starts_with = "⚑", fg = "#89b4fa" }, { equals = "Director", fg = "#89b4fa" }] }, { token = "agent", dim = true }]]
+
 [[keys.command]]
 key = "prefix+i"
 type = "plugin_action"
@@ -41,27 +56,30 @@ command = "jffiorillo.hide-idle.toggle"
 description = "toggle idle agents"
 ```
 
-Reload with `prefix+shift+r` or `herdr server reload-config`, then press `prefix+i`. The plugin also provides `hide` and `show` actions:
+Without these rows the sidebar ignores `$short_name`, and the plugin's names never appear. `fg` takes hex colors only; `#89b4fa` is the catppuccin accent.
+
+**3. Set the plugin's options** in `$(herdr plugin config-dir jffiorillo.hide-idle)/config.toml`. The file is created on first run with everything empty, which hides idle agents but pins, highlights and shortens nothing. With firstmate, use the settings under [Configure](#configure). Match the Director by its real tab label, for example `"*Director"` if the tab is called "Firstmate Director".
+
+**4. Reload and turn hiding on**
 
 ```bash
+herdr server reload-config          # add --session <name> for a named session
 herdr plugin action invoke jffiorillo.hide-idle.hide
-herdr plugin action invoke jffiorillo.hide-idle.show
 ```
 
-## Show the short names
+`prefix+i` toggles hiding from then on. `herdr plugin action invoke jffiorillo.hide-idle.show` shows everything again.
 
-The plugin reports each agent's name as the `$short_name` pane token. To use it, set your sidebar rows, for example one line per agent with 2ndmates and the Director highlighted:
+**5. Check that it works**
 
-```toml
-[ui.sidebar.agents]
-rows = [["state_icon", { token = "$short_name", bold = true, rules = [{ starts_with = "⚑", fg = "#89b4fa" }, { equals = "Director", fg = "#89b4fa" }] }, { token = "agent", dim = true }]]
+```bash
+herdr agent list | grep -o '"short_name":"[^"]*"'   # every agent has a short name
 ```
 
-`status_indicators = "symbols"` under `[ui]` gives each state its own shape (× blocked, ◐ working, ✓ done, ○ idle), which helps when rows are no longer sorted by attention.
+In the sidebar, the Agents header shows "idle hidden", and rows use the short names. If names are missing, check that the watcher is running (`pgrep -fl hide_idle.py`, one per Herdr session) and look at `herdr plugin log`.
 
 ## Configure
 
-Settings live in the plugin's config directory (`herdr plugin config-dir jffiorillo.hide-idle`), in `config.toml`. The file is created with defaults on first run and re-read on every poll, so edits apply within `poll_seconds`.
+Settings live in the plugin's config directory (`herdr plugin config-dir jffiorillo.hide-idle`), in `config.toml`. The file is created with empty defaults on first run and re-read on every poll, so edits apply within `poll_seconds`. These are the settings for a firstmate setup:
 
 ```toml
 ttl_seconds = 300            # how long an agent may sit idle/done before hiding; 0 hides at once
