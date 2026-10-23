@@ -369,8 +369,14 @@ def watch(lock):
         ttl, now = config["ttl_seconds"], time.time()
         try:
             agents = request("agent.list", {})["agents"]
-        except (OSError, ValueError):
+        except (ConnectionRefusedError, FileNotFoundError):
             return  # Server stopped; the lock is released as we exit.
+        except (OSError, ValueError) as err:
+            # A busy server or a sleep/wake can time out or cut a request;
+            # the server is still there, so retry instead of dying silently.
+            print(f"agent.list: {err!r}", file=sys.stderr, flush=True)
+            time.sleep(config["poll_seconds"])
+            continue
         waiting = {
             f"{a['pane_id']}|{a['state_change_seq']}"
             for a in agents
@@ -393,10 +399,11 @@ def watch(lock):
             if view != last_sent:
                 apply(view)
                 last_sent = view
-        except (OSError, ValueError):
+        except (ConnectionRefusedError, FileNotFoundError):
             return
-        except RuntimeError as err:
-            print(err, file=sys.stderr, flush=True)  # Rejected request; retry next poll.
+        except (OSError, ValueError, RuntimeError) as err:
+            # Transient failure or rejected request; retry next poll.
+            print(f"{err!r}", file=sys.stderr, flush=True)
         time.sleep(config["poll_seconds"])
 
 
