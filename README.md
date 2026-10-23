@@ -8,7 +8,7 @@ A [Herdr](https://herdr.dev) plugin that keeps a busy Agents sidebar readable wi
 - **Groups** agents in a stable order, so rows don't jump around when you click them or when states change.
 - **Short names**: reports a clean name for every agent that you can show in the sidebar, with optional icons, prefix stripping and abbreviations.
 
-The naming and grouping rules understand [firstmate](https://github.com/kunchenguid/firstmate)'s layout, where each worker gets a `└ <task> · p:<id>` workspace placed right after the agent that launched it. Workers are indented under their Director or 2ndmate. Without firstmate, agents simply sort by workspace and tab order.
+The naming and grouping rules understand [firstmate](https://github.com/kunchenguid/firstmate)'s layout, where each worker gets a `└ <task> · p:<id>` workspace and runs inside the worktree of the agent that launched it. Workers are indented under their Director or 2ndmate, matched by working directory, wherever their workspace sits in the list. Without firstmate, agents simply sort by workspace and tab order.
 
 ```
 ✓ Director · claude

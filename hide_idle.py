@@ -50,14 +50,17 @@ NAME_TOKEN = "short_name"
 # Pane metadata token ranking a workspace's own agent ("0") before the mates
 # nested in it ("1").
 RANK_TOKEN = "hide_idle_rank"
+# Pane metadata token with the zero-padded workspace position of the agent's
+# group: its parent's workspace for a nested mate, else its own.
+GROUP_TOKEN = "hide_idle_group"
 # Structural order only, so rows never move when an agent is clicked (seen) or
-# changes state. Firstmate places each mate's workspace right after the
-# workspace of the agent that launched it, so workspace order groups mates
-# under their parent.
+# changes state. Mates sort with their parent even when their workspace was
+# opened elsewhere in the list.
 SORT = [
     {"field": {"token": TOP_TOKEN}, "order": "asc"},
-    {"field": "workspace_order", "order": "asc"},
+    {"field": {"token": GROUP_TOKEN}, "order": "asc"},
     {"field": {"token": RANK_TOKEN}, "order": "asc"},
+    {"field": "workspace_order", "order": "asc"},
     {"field": "tab_order", "order": "asc"},
     {"field": "pane_order", "order": "asc"},
 ]
@@ -210,18 +213,40 @@ def with_icon(name, name_icons, strip_prefixes=()):
     return f"{icon} {name}" if icon else name
 
 
+def inside(path, parent):
+    return bool(path and parent) and (path == parent or path.startswith(parent.rstrip("/") + "/"))
+
+
+def parent_of(agent, owners):
+    """The owner whose working directory contains the agent's, deepest first.
+
+    Firstmate runs each mate inside the worktree of the agent that launched it,
+    so the containing directory identifies the parent wherever its workspace is.
+    """
+    matches = [o for o in owners if o is not agent and inside(agent.get("cwd"), o.get("cwd"))]
+    return max(matches, key=lambda o: len(o["cwd"]), default=None)
+
+
 def sync_name_tokens(config, snapshot, agents):
-    """Report each agent's short name and nesting rank, only when they changed."""
+    """Report each agent's short name, group, and nesting rank, only when they changed."""
     workspaces = {w["workspace_id"]: w.get("label") or "" for w in snapshot["workspaces"]}
+    order = {w["workspace_id"]: i for i, w in enumerate(snapshot["workspaces"])}
     tabs = {t["tab_id"]: t.get("label") or "" for t in snapshot["tabs"]}
+    named = []
     for a in agents:
         name, nested = short_name(
             workspaces.get(a.get("workspace_id"), ""), tabs.get(a.get("tab_id"), ""), config["name_aliases"]
         )
-        if not name:
-            continue
-        name = with_icon(name, config["name_icons"], config["strip_prefixes"])
-        tokens ={NAME_TOKEN: f"└ {name}" if nested else name, RANK_TOKEN: "1" if nested else "0"}
+        if name:
+            named.append((a, with_icon(name, config["name_icons"], config["strip_prefixes"]), nested))
+    owners = [a for a, _, nested in named if not nested]
+    for a, name, nested in named:
+        group = (nested and parent_of(a, owners)) or a
+        tokens = {
+            NAME_TOKEN: f"└ {name}" if nested else name,
+            RANK_TOKEN: "1" if nested else "0",
+            GROUP_TOKEN: f"{order.get(group.get('workspace_id'), len(order)):04d}",
+        }
         current = a.get("tokens") or {}
         if any(current.get(key) != value for key, value in tokens.items()):
             request("pane.report_metadata", {"pane_id": a["pane_id"], "source": SOURCE, "tokens": tokens})
