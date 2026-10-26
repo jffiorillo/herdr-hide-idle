@@ -13,6 +13,7 @@ Config (HERDR_PLUGIN_CONFIG_DIR/config.toml, re-read on every poll):
     top_workspaces = []  # agents sorted to the top of the list, same matching
     top_tabs = ["Director"]
     top_panes = []
+    machine_order = 0  # where this machine's agents sort when Herdr shows several
 """
 
 import fcntl
@@ -40,6 +41,7 @@ DEFAULTS = {
     "name_icons": [],
     "strip_prefixes": [],
     "name_aliases": [],
+    "machine_order": 0,
 }
 # Pane metadata token marking agents that sort first; views can only sort on
 # built-in fields or tokens, so labels are mapped onto this token.
@@ -53,11 +55,20 @@ RANK_TOKEN = "hide_idle_rank"
 # Pane metadata token with the zero-padded workspace position of the agent's
 # group: its parent's workspace for a nested mate, else its own.
 GROUP_TOKEN = "hide_idle_group"
+# Pane metadata token naming the machine, so each machine's agents stay together
+# when Herdr lists agents from several machines.
+MACHINE_TOKEN = "hide_idle_machine"
+# Pane metadata token marking agents that have waited past the TTL. Hiding goes
+# through a token rather than pane ids because Herdr applies the focused
+# machine's view to every machine's agents, and pane ids only match the focused
+# machine's agents, while tokens match on all of them.
+HIDE_TOKEN = "hide_idle_hidden"
 # Structural order only, so rows never move when an agent is clicked (seen) or
 # changes state. Mates sort with their parent even when their workspace was
 # opened elsewhere in the list.
 SORT = [
     {"field": {"token": TOP_TOKEN}, "order": "asc"},
+    {"field": {"token": MACHINE_TOKEN}, "order": "asc"},
     {"field": {"token": GROUP_TOKEN}, "order": "asc"},
     {"field": {"token": RANK_TOKEN}, "order": "asc"},
     {"field": "workspace_order", "order": "asc"},
@@ -94,6 +105,10 @@ strip_prefixes = []
 
 # Abbreviations for words in firstmate labels, as "word=short", e.g. "project=pj".
 name_aliases = []
+
+# Where this machine's agents sort when Herdr shows agents from several machines
+# (saved machines). Lower comes first; ties sort by hostname.
+machine_order = 0
 """
 
 
@@ -105,9 +120,8 @@ def plugin_dir(env, fallback):
 
 STATE_DIR = plugin_dir("HERDR_PLUGIN_STATE_DIR", "~/.local/state/herdr-hide-idle")
 CONFIG_DIR = plugin_dir("HERDR_PLUGIN_CONFIG_DIR", "~/.config/herdr-hide-idle")
-# Tracking is per server, since pane ids and sequence numbers are per server.
+# One watcher per server, since pane ids and sequence numbers are per server.
 SERVER_KEY = hashlib.sha1(SOCKET_PATH.encode()).hexdigest()[:12]
-TRACK_PATH = os.path.join(STATE_DIR, f"tracked-{SERVER_KEY}.json")
 LOCK_PATH = os.path.join(STATE_DIR, f"watch-{SERVER_KEY}.lock")
 HIDDEN_PATH = os.path.join(STATE_DIR, "hidden")
 
@@ -153,12 +167,6 @@ def matching_panes(config, kind, snapshot):
         or matches(tabs.get(p["tab_id"], ""), "tabs")
         or matches(p.get("label") or "", "panes")
     )
-
-
-def snapshot_if_needed(config):
-    if has_patterns(config, "pin") or has_patterns(config, "top"):
-        return request("session.snapshot", {})["snapshot"]
-    return None
 
 
 def short_name(workspace, tab, aliases=()):
@@ -227,8 +235,13 @@ def parent_of(agent, owners):
     return max(matches, key=lambda o: len(o["cwd"]), default=None)
 
 
+def machine_key(config):
+    host = socket.gethostname().split(".")[0].lower()
+    return f"{int(config['machine_order']):04d}-{host}"
+
+
 def sync_name_tokens(config, snapshot, agents):
-    """Report each agent's short name, group, and nesting rank, only when they changed."""
+    """Report each agent's short name, machine, group, and nesting rank, only when they changed."""
     workspaces = {w["workspace_id"]: w.get("label") or "" for w in snapshot["workspaces"]}
     order = {w["workspace_id"]: i for i, w in enumerate(snapshot["workspaces"])}
     tabs = {t["tab_id"]: t.get("label") or "" for t in snapshot["tabs"]}
@@ -245,6 +258,7 @@ def sync_name_tokens(config, snapshot, agents):
         tokens = {
             NAME_TOKEN: f"└ {name}" if nested else name,
             RANK_TOKEN: "1" if nested else "0",
+            MACHINE_TOKEN: machine_key(config),
             GROUP_TOKEN: f"{order.get(group.get('workspace_id'), len(order)):04d}",
         }
         current = a.get("tokens") or {}
@@ -252,12 +266,12 @@ def sync_name_tokens(config, snapshot, agents):
             request("pane.report_metadata", {"pane_id": a["pane_id"], "source": SOURCE, "tokens": tokens})
 
 
-def sync_top_tokens(config, snapshot, agents):
-    """Tag top agents with TOP_TOKEN and untag panes that no longer match."""
-    top = set(matching_panes(config, "top", snapshot)) if snapshot else set()
-    tagged = {a["pane_id"] for a in agents if TOP_TOKEN in (a.get("tokens") or {})}
-    for pane, value in [(p, "0") for p in top - tagged] + [(p, None) for p in tagged - top]:
-        request("pane.report_metadata", {"pane_id": pane, "source": SOURCE, "tokens": {TOP_TOKEN: value}})
+def sync_flag_token(agents, token, panes):
+    """Tag `panes` with `token` and untag agents that are no longer in it."""
+    panes = set(panes)
+    tagged = {a["pane_id"] for a in agents if token in (a.get("tokens") or {})}
+    for pane, value in [(p, "0") for p in panes - tagged] + [(p, None) for p in tagged - panes]:
+        request("pane.report_metadata", {"pane_id": pane, "source": SOURCE, "tokens": {token: value}})
 
 
 def read_hidden():
@@ -290,61 +304,21 @@ def request(method, params):
     return response["result"]
 
 
-def build_view(hidden, expired, ttl, pinned):
+def build_view(hidden):
     """The view to install.
 
-    Hidden keeps working/blocked agents, the current tab, pinned panes, and
-    waiting agents not yet expired. Both modes use the structural SORT.
+    Hidden keeps working/blocked agents, the current tab, and agents the watcher
+    has not tagged with HIDE_TOKEN. Both modes use the structural SORT. The view
+    only refers to tokens and status, so it means the same on every machine.
     """
     if not hidden:
         return {"source": SOURCE, "filter": None, "sort": SORT}
-    if ttl <= 0:
-        stale = {"op": "in", "field": "status", "values": WAITING}
-    elif expired:
-        # Match the expired state changes too, so an agent that wakes up gets a
-        # new sequence number and reappears immediately instead of on the next
-        # poll. Two `in` nodes keep this within Herdr's 64-node filter limit.
-        stale = {
-            "op": "all",
-            "filters": [
-                {"op": "in", "field": "pane_id", "values": sorted({pane for pane, _ in expired})},
-                {"op": "in", "field": "state_change_seq", "values": sorted({seq for _, seq in expired})},
-            ],
-        }
-    else:
-        stale = None
     keep = [
         {"op": "not", "filter": {"op": "in", "field": "status", "values": WAITING}},
         {"op": "eq", "field": "tab_id", "value": {"context": "current_tab_id"}},
+        {"op": "not", "filter": {"op": "exists", "field": {"token": HIDE_TOKEN}}},
     ]
-    if pinned:
-        keep.append({"op": "in", "field": "pane_id", "values": pinned})
-    keep.append({"op": "not", "filter": stale} if stale else {"op": "exists", "field": "pane_id"})
-    view = {"source": SOURCE, "label": "idle hidden", "filter": {"op": "any", "filters": keep}}
-    view["sort"] = SORT
-    return view
-
-
-def load_expired(ttl):
-    try:
-        with open(TRACK_PATH) as f:
-            first_seen = json.load(f)
-    except (FileNotFoundError, ValueError):
-        return []
-    now = time.time()
-    return sorted(
-        (key.split("|")[0], int(key.split("|")[1]))
-        for key, since in first_seen.items()
-        if now - since >= ttl
-    )
-
-
-def current_view(hidden, config=None, snapshot=None):
-    config = config or read_config()
-    snapshot = snapshot or snapshot_if_needed(config)
-    ttl = config["ttl_seconds"]
-    pinned = matching_panes(config, "pin", snapshot) if snapshot else []
-    return build_view(hidden, load_expired(ttl), ttl, pinned)
+    return {"source": SOURCE, "label": "idle hidden", "filter": {"op": "any", "filters": keep}, "sort": SORT}
 
 
 def apply(view):
@@ -412,15 +386,15 @@ def watch(lock):
         start = now - ttl if fresh else now
         first_seen = {key: first_seen.get(key, start) for key in waiting}
         fresh = False
-        with open(TRACK_PATH + ".tmp", "w") as f:
-            json.dump(first_seen, f)
-        os.replace(TRACK_PATH + ".tmp", TRACK_PATH)
+        expired = {key.split("|")[0] for key, since in first_seen.items() if now - since >= ttl}
 
         try:
             snapshot = request("session.snapshot", {})["snapshot"]
             sync_name_tokens(config, snapshot, agents)
-            sync_top_tokens(config, snapshot, agents)
-            view = current_view(read_hidden(), config, snapshot)
+            sync_flag_token(agents, TOP_TOKEN, matching_panes(config, "top", snapshot))
+            # Pinned agents are never tagged, so they stay visible.
+            sync_flag_token(agents, HIDE_TOKEN, expired - set(matching_panes(config, "pin", snapshot)))
+            view = build_view(read_hidden())
             if view != last_sent:
                 apply(view)
                 last_sent = view
@@ -455,7 +429,7 @@ def main():
         # poll applies the view.
         watch(lock)
         return
-    apply(current_view(hidden))
+    apply(build_view(hidden))
 
 
 if __name__ == "__main__":
