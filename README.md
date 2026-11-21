@@ -105,13 +105,21 @@ Agents in the tab you are looking at are always shown.
 
 ### Saved machines
 
-When Herdr shows agents from [saved machines](https://herdr.dev), it lists them all in one panel and applies the view of the machine you are focused on. Run the plugin on every machine so each one tags its own agents. The panel then hides, pins and orders agents the same way whichever machine's agent you click. Each machine's agents stay together. Set `machine_order` to choose which machine comes first. Hiding is toggled per machine: `prefix+i` acts on the focused machine.
+When Herdr shows agents from [saved machines](https://herdr.dev), it lists them all in one panel and applies the view of the machine you are focused on, which changes when you click an agent on another machine.
+
+- **Each machine runs its own watcher and keeps its own hide flag.** Install the plugin on every machine. Its watcher tags only that machine's agents: names, order, and whether an idle agent is hidden.
+- **The toggle acts on the selected machine.** `prefix+i` (and the `hide`/`show` actions) run on the machine whose agent is selected and flip only that machine's flag, so they hide or show only that machine's idle agents. Turn hiding on once per machine, as in step 4 of [Install](#install), with that machine selected or with `herdr --machine <name> plugin action invoke jffiorillo.hide-idle.hide`.
+- **The view is the same everywhere.** Every machine installs the same "idle hidden" view, so the panel hides, pins and orders agents the same way whichever machine's agent you click.
+
+Each machine's agents stay together. Set `machine_order` to choose which machine comes first.
 
 ## How it works
 
 The plugin uses Herdr's `agent.view.set` socket API, which filters and sorts the built-in Agents sidebar. Herdr's filter can't express "idle for 5 minutes", so a small watcher process polls `agent.list`, records when each agent started waiting, and tags those past the TTL with a pane token that the view hides. A hidden agent reappears as soon as it starts working or gets blocked. If it finishes again before the next poll, it reappears within `poll_seconds`.
 
-The watcher starts from the plugin's startup hook (or from the first toggle, if the plugin was installed while Herdr was running) and exits when its Herdr server stops or restarts. It only talks to the local Herdr socket. Its state lives in the plugin's state directory.
+The hide flag only decides whether the watcher tags agents: the view itself is always the same "idle hidden" view, and with hiding off no agent carries the tag, so all are shown. Toggling writes the flag and the watcher applies it on its next poll.
+
+The watcher starts from the plugin's startup hook (or from the first toggle, if the plugin was installed while Herdr was running) and exits when its Herdr server stops or restarts. After a live handoff or restart, the new server's watcher waits for the old one to exit (up to `2 × poll_seconds + 5` seconds) and then re-reports every agent's tokens. It only talks to the local Herdr socket. Its state lives in the plugin's state directory.
 
 ## License
 
