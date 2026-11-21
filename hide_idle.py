@@ -304,29 +304,21 @@ def request(method, params):
     return response["result"]
 
 
-def build_view(hidden):
-    """The view to install.
+def build_view():
+    """The view to install, identical on every machine and in both modes.
 
-    Hidden keeps working/blocked agents, the current tab, and agents the watcher
-    has not tagged with HIDE_TOKEN. Both modes use the structural SORT. The view
-    only refers to tokens and status, so it means the same on every machine.
+    It keeps working/blocked agents, the current tab, and agents without
+    HIDE_TOKEN, sorted by the structural SORT. Herdr applies the focused
+    machine's view to every machine's agents, so the view never depends on this
+    machine's hidden flag; the flag only decides whether the watcher tags this
+    machine's agents with HIDE_TOKEN.
     """
-    if not hidden:
-        return {"source": SOURCE, "filter": None, "sort": SORT}
     keep = [
         {"op": "not", "filter": {"op": "in", "field": "status", "values": WAITING}},
         {"op": "eq", "field": "tab_id", "value": {"context": "current_tab_id"}},
         {"op": "not", "filter": {"op": "exists", "field": {"token": HIDE_TOKEN}}},
     ]
     return {"source": SOURCE, "label": "idle hidden", "filter": {"op": "any", "filters": keep}, "sort": SORT}
-
-
-def apply(view):
-    if view:
-        request("agent.view.set", view)
-    else:
-        # Only clear our own view so we never wipe one another plugin installed.
-        request("agent.view.clear", {"source": SOURCE})
 
 
 def notify(title):
@@ -336,15 +328,22 @@ def notify(title):
         pass  # Feedback only; the view change already succeeded.
 
 
-def acquire_watch_lock():
-    """Return the lock file if this process may become the watcher, else None."""
+def acquire_watch_lock(wait=0):
+    """Return the lock file if this process may become the watcher, else None.
+
+    With `wait`, keep retrying for that many seconds before giving up.
+    """
+    deadline = time.monotonic() + wait
     lock = open(LOCK_PATH, "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock.close()
-        return None
-    return lock
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                lock.close()
+                return None
+            time.sleep(0.5)
 
 
 def watch(lock):
@@ -354,10 +353,13 @@ def watch(lock):
     """
     first_seen = {}
     fresh = True
-    last_sent = object()  # Never equal to a view, so the first poll always applies.
+    view_set = False
     # A restarted server binds a new socket file at the same path; exit then so
     # the new server's startup hook can start its own watcher.
-    server_inode = os.stat(SOCKET_PATH).st_ino
+    try:
+        server_inode = os.stat(SOCKET_PATH).st_ino
+    except FileNotFoundError:
+        return
     while True:
         try:
             if os.stat(SOCKET_PATH).st_ino != server_inode:
@@ -392,12 +394,14 @@ def watch(lock):
             snapshot = request("session.snapshot", {})["snapshot"]
             sync_name_tokens(config, snapshot, agents)
             sync_flag_token(agents, TOP_TOKEN, matching_panes(config, "top", snapshot))
-            # Pinned agents are never tagged, so they stay visible.
-            sync_flag_token(agents, HIDE_TOKEN, expired - set(matching_panes(config, "pin", snapshot)))
-            view = build_view(read_hidden())
-            if view != last_sent:
-                apply(view)
-                last_sent = view
+            # This machine's flag only decides which of its agents are tagged;
+            # the view is the same everywhere. Pinned agents are never tagged,
+            # so they stay visible.
+            hide = expired - set(matching_panes(config, "pin", snapshot)) if read_hidden() else set()
+            sync_flag_token(agents, HIDE_TOKEN, hide)
+            if not view_set:
+                request("agent.view.set", build_view())
+                view_set = True
         except (ConnectionRefusedError, FileNotFoundError):
             return
         except (OSError, ValueError, RuntimeError) as err:
@@ -409,7 +413,10 @@ def watch(lock):
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "toggle"
     if cmd == "watch":
-        lock = acquire_watch_lock()
+        # After a live handoff or restart the new server keeps the socket path,
+        # so the old watcher may still hold the lock until its next poll sees
+        # the new socket. Wait for it rather than leave the server unwatched.
+        lock = acquire_watch_lock(wait=2 * read_config()["poll_seconds"] + 5)
         if lock:
             watch(lock)
         return
@@ -426,10 +433,9 @@ def main():
     if lock:
         # No watcher is running for this server (e.g. plugin linked after the
         # server started), so this invocation becomes the watcher; its first
-        # poll applies the view.
+        # poll applies the flag and the view.
         watch(lock)
-        return
-    apply(build_view(hidden))
+    # Otherwise the running watcher applies the flag on its next poll.
 
 
 if __name__ == "__main__":
